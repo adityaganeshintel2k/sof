@@ -344,6 +344,7 @@ static int llext_manager_load_module(struct lib_manager_module *mctx)
 	return 0;
 #ifdef CONFIG_SOF_USERSPACE_LL
 e_data:
+	mctx->mapped = false;
 	if (data_size)
 		llext_manager_align_unmap(va_base_data, data_size);
 #endif
@@ -609,6 +610,53 @@ static int llext_manager_mod_find(const struct lib_manager_mod_ctx *ctx, unsigne
 	}
 
 	return i - 1;
+}
+
+static bool llext_manager_pc_in_segment(uintptr_t pc,
+					const struct lib_manager_segment_desc *segment)
+{
+	uintptr_t start = segment->addr;
+
+	return segment->size && pc >= start && pc - start < segment->size;
+}
+
+bool llext_manager_find_module_by_pc(uintptr_t pc, uint32_t *module_id)
+{
+	struct ext_library *ext_lib = ext_lib_get();
+
+	if (!ext_lib || !module_id)
+		return false;
+
+	/*
+	 * This is diagnostic-only: the manager has no lockless snapshot for
+	 * exception-time readers, so this result must not control recovery.
+	 */
+	for (unsigned int lib_idx = 1; lib_idx < ARRAY_SIZE(ext_lib->desc); lib_idx++) {
+		struct lib_manager_mod_ctx *ctx = ext_lib->desc[lib_idx];
+
+		if (!ctx || !ctx->mod)
+			continue;
+
+		for (unsigned int mod_idx = 0; mod_idx < ctx->n_mod; mod_idx++) {
+			struct lib_manager_module *mctx = &ctx->mod[mod_idx];
+
+			if (!mctx->mapped || !mctx->llext)
+				continue;
+
+			if (llext_manager_pc_in_segment(pc, &mctx->segment[LIB_MANAGER_TEXT])) {
+				*module_id = LIB_MANAGER_PACK_MODULE_ID(lib_idx, mctx->start_idx);
+				return true;
+			}
+#if CONFIG_SOF_USERSPACE_PROXY || CONFIG_SOF_USERSPACE_LL
+			if (llext_manager_pc_in_segment(pc, &mctx->segment[LIB_MANAGER_COLD])) {
+				*module_id = LIB_MANAGER_PACK_MODULE_ID(lib_idx, mctx->start_idx);
+				return true;
+			}
+#endif
+		}
+	}
+
+	return false;
 }
 
 static int llext_manager_link_single(uint32_t module_id, const struct sof_man_fw_desc *desc,

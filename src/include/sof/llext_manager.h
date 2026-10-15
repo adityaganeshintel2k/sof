@@ -33,6 +33,8 @@ int llext_manager_add_library(uint32_t module_id);
 int llext_manager_add_domain(const uint32_t component_id, struct k_mem_domain *domain);
 int llext_manager_rm_domain(const uint32_t component_id, struct k_mem_domain *domain);
 
+bool llext_manager_find_module_by_pc(uintptr_t pc, uint32_t *module_id);
+
 bool comp_is_llext(struct comp_dev *comp);
 #else
 #define module_is_llext(mod) false
@@ -40,6 +42,7 @@ bool comp_is_llext(struct comp_dev *comp);
 #define llext_manager_free_module(component_id) 0
 #define llext_manager_add_library(module_id) 0
 #define llext_manager_add_domain(component_id, domain) 0
+#define llext_manager_find_module_by_pc(pc, module_id) false
 #define comp_is_llext(comp) false
 #endif
 

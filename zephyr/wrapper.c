@@ -38,6 +38,10 @@
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/logging/log.h>
 
+#if defined(CONFIG_ARCH_XTENSA)
+#include <xtensa_internal.h>
+#endif
+
 LOG_MODULE_REGISTER(zephyr, CONFIG_SOF_LOG_LEVEL);
 
 extern K_KERNEL_STACK_ARRAY_DEFINE(z_interrupt_stacks, CONFIG_MP_MAX_NUM_CPUS,
@@ -354,6 +358,23 @@ void k_sys_fatal_error_handler(unsigned int reason,
 			       const struct arch_esf *esf)
 {
 	ARG_UNUSED(esf);
+
+#if defined(CONFIG_ARCH_XTENSA) && CONFIG_LIBRARY_MANAGER && CONFIG_LLEXT
+	uintptr_t pc;
+	uint32_t module_id;
+
+	if (xtensa_exception_get_pc(esf, &pc)) {
+		if (llext_manager_find_module_by_pc(pc, &module_id)) {
+			LOG_ERR("Fatal exception in LLEXT module %#x at PC %p",
+				module_id, (void *)pc);
+		} else {
+			LOG_ERR("Fatal exception outside active LLEXT executable ranges at PC %p",
+				(void *)pc);
+		}
+	} else {
+		LOG_ERR("Fatal exception PC unavailable");
+	}
+#endif
 
 #if CONFIG_SOF_BOOT_TEST
 	if (sof_boot_test_fault_expected()) {
