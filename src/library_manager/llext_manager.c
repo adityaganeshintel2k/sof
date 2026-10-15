@@ -612,14 +612,6 @@ static int llext_manager_mod_find(const struct lib_manager_mod_ctx *ctx, unsigne
 	return i - 1;
 }
 
-static bool llext_manager_pc_in_segment(uintptr_t pc,
-					const struct lib_manager_segment_desc *segment)
-{
-	uintptr_t start = segment->addr;
-
-	return segment->size && pc >= start && pc - start < segment->size;
-}
-
 bool llext_manager_find_module_by_pc(uintptr_t pc, uint32_t *module_id)
 {
 	struct ext_library *ext_lib = ext_lib_get();
@@ -643,12 +635,14 @@ bool llext_manager_find_module_by_pc(uintptr_t pc, uint32_t *module_id)
 			if (!mctx->mapped || !mctx->llext)
 				continue;
 
-			if (llext_manager_pc_in_segment(pc, &mctx->segment[LIB_MANAGER_TEXT])) {
+			if (llext_pc_in_region(pc, mctx->segment[LIB_MANAGER_TEXT].addr,
+					       mctx->segment[LIB_MANAGER_TEXT].size)) {
 				*module_id = LIB_MANAGER_PACK_MODULE_ID(lib_idx, mctx->start_idx);
 				return true;
 			}
 #if CONFIG_SOF_USERSPACE_PROXY || CONFIG_SOF_USERSPACE_LL
-			if (llext_manager_pc_in_segment(pc, &mctx->segment[LIB_MANAGER_COLD])) {
+			if (llext_pc_in_region(pc, mctx->segment[LIB_MANAGER_COLD].addr,
+					       mctx->segment[LIB_MANAGER_COLD].size)) {
 				*module_id = LIB_MANAGER_PACK_MODULE_ID(lib_idx, mctx->start_idx);
 				return true;
 			}
