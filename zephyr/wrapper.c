@@ -38,7 +38,7 @@
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/logging/log.h>
 
-#if defined(CONFIG_ARCH_XTENSA)
+#if defined(CONFIG_XTENSA)
 #include <xtensa_internal.h>
 #endif
 
@@ -359,6 +359,28 @@ void k_sys_fatal_error_handler(unsigned int reason,
 {
 	ARG_UNUSED(esf);
 
+#if CONFIG_SOF_BOOT_TEST
+	if (sof_boot_test_fault_expected()) {
+		LOG_ERR("Expected fatal error as part of boot test");
+		return;
+	}
+#endif
+
+#if CONFIG_SOF_USERSPACE_FATAL_THREAD_ABORT
+	if (reason != K_ERR_KERNEL_PANIC && reason != K_ERR_SPURIOUS_IRQ &&
+	    xtensa_exception_is_user(esf)) {
+		uintptr_t user_pc;
+
+		if (xtensa_exception_get_pc(esf, &user_pc))
+			LOG_ERR("User-mode fatal error %u in thread %p at PC %p; aborting thread",
+				reason, (void *)k_current_get(), (void *)user_pc);
+		else
+			LOG_ERR("User-mode fatal error %u in thread %p; PC unavailable; aborting thread",
+				reason, (void *)k_current_get());
+		return;
+	}
+#endif
+
 #if defined(CONFIG_ARCH_XTENSA) && CONFIG_LIBRARY_MANAGER && CONFIG_LLEXT
 	uintptr_t pc;
 	uint32_t module_id;
@@ -373,13 +395,6 @@ void k_sys_fatal_error_handler(unsigned int reason,
 		}
 	} else {
 		LOG_ERR("Fatal exception PC unavailable");
-	}
-#endif
-
-#if CONFIG_SOF_BOOT_TEST
-	if (sof_boot_test_fault_expected()) {
-		LOG_ERR("Expected fatal error as part of boot test");
-		return;
 	}
 #endif
 

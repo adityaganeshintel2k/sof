@@ -11,6 +11,9 @@ if(CONFIG_SOF_BOOT_TEST)
   zephyr_library_sources_ifdef(CONFIG_USERSPACE
     userspace/ksem.c
   )
+  zephyr_library_sources_ifdef(CONFIG_SOF_USERSPACE_FATAL_THREAD_ABORT
+    userspace/test_fatal.c
+  )
   if(CONFIG_USERSPACE AND CONFIG_SOF_USERSPACE_INTERFACE_ALLOC AND NOT CONFIG_SOF_USERSPACE_LL)
     zephyr_library_sources(userspace/test_heap_alloc.c)
   endif()

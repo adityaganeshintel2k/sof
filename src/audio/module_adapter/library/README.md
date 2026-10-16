@@ -2,7 +2,27 @@
 
 The `library` directory within the module adapter manages the lifecycle and execution isolation for dynamically loaded algorithms, often referred to as "LLEXT modules" or "Userspace Modules".
 
-It acts as a secure intermediary layer between the native SOF/Zephyr kernel execution mode (supervisor mode) and the 3rd-party module running in an isolated user-mode context. By relying on Zephyr's Userspace mechanisms (`k_mem_domain`, `K_USER` threads), a faulting or misbehaving loadable extension cannot crash the entire firmware.
+It acts as an intermediary layer between the native SOF/Zephyr kernel execution mode (supervisor mode) and a 3rd-party module running in a user-mode context. Zephyr's userspace mechanisms (`k_mem_domain`, `K_USER` threads) restrict memory access, but do not by themselves provide fault recovery. By default, SOF's fatal handler halts the firmware even for fatal user-mode faults.
+
+### Optional user-mode fatal policy
+
+On Xtensa, `CONFIG_SOF_USERSPACE_FATAL_THREAD_ABORT=y` enables an experimental
+policy, disabled by default, that logs a validated user-mode fatal fault and
+returns from `k_sys_fatal_error_handler()`. Zephyr then aborts the faulting
+thread; it does not resume the faulting instruction. This policy does not
+require the fault PC to belong to an LLEXT.
+
+The decision uses saved fault-time privilege, not merely the thread's `K_USER`
+flag. Kernel panic, supervisor-mode faults (including faults inside kernel
+syscall implementations), interrupt/nested faults and invalid exception frames
+retain the halt behavior. Stack-check faults are eligible only if their saved
+user-mode context can still be validated.
+
+This is thread abortion, not module recovery: it does not unload an LLEXT,
+reclaim resources or restart a worker. The shared userspace IPC worker can
+serve multiple modules, so aborting it can disrupt other modules and leave
+callers waiting until timeout. Architecture and Zephyr fatal diagnostics,
+coredumps and panic logging may already have run before SOF's handler.
 
 ## Architecture & Userspace Sandbox
 

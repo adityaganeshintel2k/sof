@@ -29,6 +29,19 @@ config SOF_USERSPACE_INTERFACE_DMA
 	help
 	  Allow user-space threads to use the SOF DMA interface.
 
+config SOF_USERSPACE_FATAL_THREAD_ABORT
+	bool "Abort threads on validated user-mode fatal faults"
+	depends on XTENSA && USERSPACE
+	help
+	  Log and return from the SOF fatal handler when a validated exception
+	  frame identifies a fault in user mode. Zephyr then aborts the faulting
+	  thread instead of SOF halting the firmware. Kernel panic, privileged
+	  faults, nested faults and unavailable exception frames still halt.
+
+	  This experimental policy does not unload modules, reclaim their
+	  resources or restart workers. Aborting a shared userspace worker can
+	  disrupt other modules. If unsure, leave disabled.
+
 config SOF_USERSPACE_INTERFACE_ALLOC
 	bool "Enable SOF heap alloc interface to userspace threads"
 	depends on USERSPACE

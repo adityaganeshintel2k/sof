@@ -19,6 +19,16 @@ Available tests:
      create tasks for audio pipeline logic.
 - test_mailbox.c
    - Test use of sof/mailbox.h interface from a Zephyr user thread.
+- test_fatal.c
+   - With `CONFIG_SOF_USERSPACE_FATAL_THREAD_ABORT=y`, inject user-mode CPU,
+     oops and stack-check faults without the expected-fault boot-test hook.
+     Verify thread termination and continued supervisor execution. The oops
+     and stack-check tests raise reasons directly in user mode; they do not
+     simulate kernel syscall faults or an actually corrupted stack.
+   - Reject unavailable/non-exception contexts. Kernel faults and disabled
+     policy behavior require separate runs because they halt the firmware.
+   - Zephyr can switch logging to panic mode before calling the SOF hook;
+     these tests do not assert that deferred logging remains enabled.
 
 Building for Intel Panther Lake:
 ./scripts/xtensa-build-zephyr.py --cmake-args=-DCONFIG_SOF_BOOT_TEST_STANDALONE=y \
@@ -39,6 +49,11 @@ Running test on QEMU (dc233c MMU):
       --cmake-args=-DCONFIG_SOF_USERSPACE_INTERFACE_DMA=y --cmake-args=-DCONFIG_SOF_USERSPACE_LL=y
 - Once built, run the test in QEMU:
   west build -d build-qemu_xtensa_mmu -t run
+
+To exercise the fatal policy, additionally pass
+`--cmake-args=-DCONFIG_SOF_USERSPACE_FATAL_THREAD_ABORT=y` when building.
+The test coordinator must continue after each `User-mode fatal error` log,
+and all `user_fatal_*` tests must pass.
 
 References to related assets in Zephyr codebase:
 - cavstool.py
