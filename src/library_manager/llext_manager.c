@@ -911,7 +911,11 @@ static int llext_manager_add_mod_domain(struct lib_manager_module *mctx, struct 
 
 	ret = llext_get_section_header(ldr, ext, ".coldrodata", &shdr_coldrodata);
 	if (ret < 0)
+	{
 		tr_warn(&lib_manager_tr, "couldn't get .coldrodata header");
+		tr_warn(&lib_manager_tr, "test log");
+	}
+
 	else if (shdr_coldrodata.sh_size)
 		rodata_addr = llext_peek(ldr, shdr_coldrodata.sh_offset);
 
