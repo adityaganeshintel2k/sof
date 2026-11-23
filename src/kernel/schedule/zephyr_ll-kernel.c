@@ -34,6 +34,12 @@ LOG_MODULE_DECLARE(ll_schedule, CONFIG_SOF_LOG_LEVEL);
  * otherwise a user thread could make it grant access to any kernel object.
  */
 static struct k_mutex *zephyr_ll_klocks[CONFIG_CORE_COUNT];
+
+/* Kernel-only copy of the per-core scheduler pointers, for fault recovery */
+static struct zephyr_ll *zephyr_ll_ksch[CONFIG_CORE_COUNT];
+
+/* Upper bound on the temporary run list walked by the fault handler */
+#define ZEPHYR_LL_FAULT_MAX_TASKS	256
 #endif
 
 #if CONFIG_DYNAMIC_OBJECTS
@@ -220,32 +226,80 @@ void user_ll_grant_access(struct k_thread *thread, int core)
 	k_thread_access_grant(thread, zephyr_ll_klocks[core]);
 }
 
-/**
- * @brief Release all LL scheduler locks held by the faulting thread.
+/*
+ * Repair the scheduler state of a core whose LL thread died in the middle of
+ * a tick, while holding the core's LL lock.
  *
- * Zephyr does not release mutexes when a thread is aborted. If a user-space
- * LL thread faults while running a module, it still holds its core's LL
- * scheduler lock (zephyr_ll_run() keeps it locked while running tasks), and
- * every later user_ll_lock_sched() on that core, e.g. from the IPC user
- * thread triggering a pipeline, pends forever.
+ * The task being run is quarantined: marked faulted, so that it can never be
+ * scheduled again, and cancelled, so that the next tick removes it from the
+ * scheduler. The tasks already run in the tick are moved from the temporary
+ * list back to the head of the task list, in front of the tasks not run yet,
+ * which restores the priority order.
  *
- * Must only be called from k_sys_fatal_error_handler(), before
- * z_fatal_error() aborts _current. The current thread is the mutex owner
- * there, so the regular unlock path is used to hand the lock over to the
- * first waiter. Rescheduling is deferred until the exception returns.
+ * The scheduler data is writable by the dying thread, so sch->running is
+ * only trusted if it is on the temporary list, and the list walk is bounded.
+ *
+ * @return 0 on success, -EINVAL if the scheduler state cannot be trusted.
+ */
+static int zephyr_ll_fault_repair(struct zephyr_ll *sch)
+{
+	struct task *running = sch->running;
+	struct list_item *first = sch->tasks.next;
+	struct list_item *list, *tmp;
+	unsigned int n = 0;
+	bool found = false;
+
+	list_for_item(list, &sch->run_list) {
+		if (++n > ZEPHYR_LL_FAULT_MAX_TASKS) {
+			tr_err(&ll_tr, "core %u: LL run list corrupted", sch->core);
+			return -EINVAL;
+		}
+
+		if (container_of(list, struct task, list) == running)
+			found = true;
+	}
+
+	if (running && found) {
+		struct zephyr_ll_pdata *pdata = running->priv_data;
+
+		if (pdata) {
+			pdata->faulted = true;
+			/* back on the main list below, no longer being run */
+			pdata->run = false;
+		}
+		running->state = SOF_TASK_STATE_CANCEL;
+
+		tr_err(&ll_tr, "core %u: task %p (%pU) faulted, cancelled",
+		       sch->core, running, running->uid);
+	}
+
+	sch->running = NULL;
+
+	list_for_item_safe(list, tmp, &sch->run_list) {
+		list_item_del(list);
+		/* insert in front of the first task not run in this tick */
+		list_item_append(list, first);
+	}
+
+	return 0;
+}
+
+/*
+ * Release all LL scheduler locks held by the faulting thread.
+ *
+ * Zephyr does not release mutexes when a thread is aborted, so every later
+ * user_ll_lock_sched() on that core, e.g. from the IPC user thread
+ * triggering a pipeline, would pend forever.
+ *
+ * The current thread is the mutex owner, so the regular unlock path is used
+ * to hand the lock over to the first waiter. Rescheduling is deferred until
+ * the exception returns.
  *
  * Uses the kernel-only zephyr_ll_klocks[] copy: zephyr_ll_locks[] is
  * user-writable and must not be trusted here.
- *
- * @note The scheduler state protected by the lock is not repaired: tasks
- *	 run in the interrupted tick stay on the dead thread's temporary list
- *	 and no further LL ticks happen on that core.
- *
- * @return Number of LL scheduler locks released.
  */
-int zephyr_ll_release_locks_of_current(void)
+static int zephyr_ll_release_locks(struct k_thread *thread)
 {
-	struct k_thread *thread = k_current_get();
 	int released = 0;
 	int core;
 
@@ -268,6 +322,44 @@ int zephyr_ll_release_locks_of_current(void)
 
 	return released;
 }
+
+/**
+ * @brief Recover the LL scheduler from a fault of the current user thread.
+ *
+ * Must only be called from k_sys_fatal_error_handler(), before
+ * z_fatal_error() aborts _current.
+ *
+ * If the faulting thread is a core's LL thread, the scheduler state it was
+ * modifying under the LL lock is repaired first, quarantining the task being
+ * run, and a restart of the LL thread is requested. It is done later from a
+ * work queue, after the thread has been aborted. Then all LL locks held by
+ * the thread are released, which lets their waiters, e.g. the IPC user
+ * thread, proceed.
+ *
+ * @return Number of LL scheduler locks released.
+ */
+int zephyr_ll_fault_recover_current(void)
+{
+	struct k_thread *thread = k_current_get();
+	int core = zephyr_domain_thread_core(thread);
+	bool restart = core >= 0;
+
+	if (restart && zephyr_ll_ksch[core] && zephyr_ll_klocks[core] &&
+	    zephyr_ll_klocks[core]->owner == thread &&
+	    zephyr_ll_fault_repair(zephyr_ll_ksch[core]) < 0) {
+		/* a new LL thread would run on corrupted lists */
+		tr_err(&ll_tr, "core %d: LL scheduler not recoverable", core);
+		restart = false;
+	}
+
+	/* before releasing the locks, the new owner may use the task lists */
+	int released = zephyr_ll_release_locks(thread);
+
+	if (restart)
+		zephyr_domain_thread_restart(core);
+
+	return released;
+}
 #endif /* CONFIG_SOF_USERSPACE_LL */
 
 #if CONFIG_SOF_BOOT_TEST_STANDALONE || CONFIG_LIBRARY
@@ -280,6 +372,7 @@ static void zephyr_ll_scheduler_free(void *data, uint32_t flags)
 #if CONFIG_SOF_USERSPACE_LL
 	zephyr_ll_locks[sch->core] = NULL;
 	zephyr_ll_klocks[sch->core] = NULL;
+	zephyr_ll_ksch[sch->core] = NULL;
 	k_object_free(sch->lock);
 #endif
 
@@ -334,6 +427,7 @@ __cold int zephyr_ll_scheduler_init(struct ll_schedule_domain *domain)
 	memset(sch, 0, sizeof(*sch));
 
 	list_init(&sch->tasks);
+	list_init(&sch->run_list);
 	sch->ll_domain = domain;
 	sch->core = core;
 	sch->n_tasks = 0;
@@ -349,6 +443,7 @@ __cold int zephyr_ll_scheduler_init(struct ll_schedule_domain *domain)
 	assert(core < CONFIG_CORE_COUNT && zephyr_ll_locks[core] == NULL);
 	zephyr_ll_locks[core] = sch->lock;
 	zephyr_ll_klocks[core] = sch->lock;
+	zephyr_ll_ksch[core] = sch;
 	k_mutex_init(sch->lock);
 
 	tr_dbg(&ll_tr, "ll-scheduler init done, sch %p sch->lock %p", sch, sch->lock);

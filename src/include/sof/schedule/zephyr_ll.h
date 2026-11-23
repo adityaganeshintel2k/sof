@@ -27,6 +27,13 @@ struct zephyr_ll {
 	unsigned int n_tasks;			/* task counter */
 	struct ll_schedule_domain *ll_domain;	/* scheduling domain */
 	unsigned int core;			/* core ID of this instance */
+	/*
+	 * Tasks already run in the current tick. Kept here and not on the LL
+	 * thread stack, so that the list stays valid if the LL thread dies
+	 * in the middle of a tick, see zephyr_ll_fault_recover_current().
+	 */
+	struct list_item run_list;
+	struct task *running;			/* task currently being run */
 #if CONFIG_SOF_USERSPACE_LL
 	struct k_mutex *lock;			/* mutex for userspace */
 #endif
@@ -36,6 +43,7 @@ struct zephyr_ll {
 struct zephyr_ll_pdata {
 	bool run;
 	bool freeing;
+	bool faulted;	/* the LL thread faulted running it, never run again */
 	struct k_sem *sem_p;
 #if !CONFIG_DYNAMIC_OBJECTS
 	struct k_sem sem;
@@ -97,7 +105,7 @@ struct k_thread *zephyr_ll_init_context(void *data, struct task *task);
 
 /* fatal error handling, see zephyr_ll.c and zephyr_ll-kernel.c */
 void zephyr_ll_lock_shadow_reset(int core);
-int zephyr_ll_release_locks_of_current(void);
+int zephyr_ll_fault_recover_current(void);
 #endif
 
 struct zephyr_domain_thread {

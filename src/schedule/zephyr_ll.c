@@ -66,7 +66,7 @@ static inline void zephyr_ll_lock_releasing(int core)
 
 /*
  * Forget the recorded owner of the core's LL lock. Only for
- * zephyr_ll_release_locks_of_current(), when the owner is dying and its lock
+ * zephyr_ll_fault_recover_current(), when the owner is dying and its lock
  * is about to be force-released on its behalf. Must be called before the
  * unlock: the new owner's zephyr_ll_lock_acquired() counts depth from 0.
  */
@@ -226,7 +226,7 @@ static void zephyr_ll_run(void *data)
 {
 	struct zephyr_ll *sch = data;
 	struct task *task;
-	struct list_item *list, *tmp, task_head = LIST_INIT(task_head);
+	struct list_item *list, *tmp, *task_head = &sch->run_list;
 	uint32_t flags;
 
 	tr_dbg(&ll_tr, "entry");
@@ -238,7 +238,8 @@ static void zephyr_ll_run(void *data)
 	 * removed from or added to the list, including the task that was
 	 * executed. Use a temporary list to make sure that the main list is
 	 * always consistent and contains the tasks, that we haven't run in this
-	 * cycle yet.
+	 * cycle yet. The temporary list is in the scheduler data and not on
+	 * the stack, so that it survives the LL thread faulting in a task.
 	 */
 
 	for (list = sch->tasks.next; !list_is_empty(&sch->tasks); list = sch->tasks.next) {
@@ -259,7 +260,8 @@ static void zephyr_ll_run(void *data)
 
 		/* Move the task to a temporary list */
 		list_item_del(list);
-		list_item_append(list, &task_head);
+		list_item_append(list, task_head);
+		sch->running = task;
 
 		/* in user-space LL builds, the LL lock protects LL
 		 * tasks against IPC thread, so the lock must be held
@@ -276,6 +278,7 @@ static void zephyr_ll_run(void *data)
 		 * SOF_TASK_STATE_COMPLETED or SOF_TASK_STATE_RESCHEDULE
 		 */
 		state = do_task_run(task);
+		sch->running = NULL;
 		if (state != SOF_TASK_STATE_COMPLETED &&
 		    state != SOF_TASK_STATE_RESCHEDULE) {
 			tr_err(&ll_tr,
@@ -306,7 +309,7 @@ static void zephyr_ll_run(void *data)
 	}
 
 	/* Move tasks back */
-	list_for_item_safe(list, tmp, &task_head) {
+	list_for_item_safe(list, tmp, task_head) {
 		list_item_del(list);
 		list_item_append(list, &sch->tasks);
 	}
@@ -366,6 +369,13 @@ static int zephyr_ll_task_schedule_common(struct zephyr_ll *sch, struct task *ta
 		 */
 		zephyr_ll_unlock(sch, &flags);
 		return -EDEADLK;
+	}
+
+	if (pdata->faulted) {
+		/* the LL thread faulted running this task, it is quarantined */
+		zephyr_ll_unlock(sch, &flags);
+		tr_err(&ll_tr, "task %p (%pU) faulted, not scheduling", task, task->uid);
+		return -EIO;
 	}
 
 	/* check if the task is already scheduled */
@@ -540,6 +550,13 @@ int zephyr_ll_task_cancel(void *data, struct task *task)
 }
 
 #if CONFIG_SOF_USERSPACE_LL
+bool zephyr_ll_task_is_faulted(const struct task *task)
+{
+	const struct zephyr_ll_pdata *pdata = task->priv_data;
+
+	return pdata && pdata->faulted;
+}
+
 /* For tasks that kernel threads create at boot, which are never freed */
 struct task *zephyr_ll_task_alloc(void)
 {

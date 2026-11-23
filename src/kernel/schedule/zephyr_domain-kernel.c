@@ -27,6 +27,9 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/clock.h>
+#ifdef CONFIG_SOF_USERSPACE_LL
+#include <zephyr/internal/syscall_handler.h>
+#endif
 
 LOG_MODULE_DECLARE(ll_schedule, CONFIG_SOF_LOG_LEVEL);
 
@@ -218,6 +221,121 @@ static int zephyr_domain_unregister(struct ll_schedule_domain *domain,
 static struct k_thread *ll_thread_tid[CONFIG_CORE_COUNT];
 
 /*
+ * LL thread fault recovery.
+ *
+ * A user-mode fault of an LL thread only aborts that thread, see
+ * k_sys_fatal_error_handler(), and the thread is then re-created on the same
+ * thread object and stack by a work item, so all pointers to it stay valid.
+ *
+ * Aborting a thread clears all its kernel object permissions and frees
+ * dynamic objects no other thread has access to. The LL thread is granted
+ * access to objects all along, e.g. per-task semaphores and DAI mutexes, so
+ * these permissions cannot be rebuilt. Instead, while the faulting thread is
+ * still alive, they are copied to a per-core holder: a thread object, which
+ * is never started, used only for its permission index. The holder keeps the
+ * objects alive, and the restarted thread inherits the permissions back.
+ *
+ * Dynamic objects are freed when no thread has access to them any more, so
+ * the holder has access to itself: the thread allocating it may exit, e.g.
+ * the main thread, which initializes the LL thread of the primary core.
+ */
+#define ZEPHYR_LL_RECOVERY_STACK_SIZE	2048
+
+static struct k_thread *ll_perm_holder[CONFIG_CORE_COUNT];
+static K_KERNEL_STACK_DEFINE(ll_recovery_stack, ZEPHYR_LL_RECOVERY_STACK_SIZE);
+static struct k_work_q ll_recovery_wq;
+static struct k_work ll_restart_work[CONFIG_CORE_COUNT];
+
+/*
+ * Create a core's LL thread on the given thread object, without starting it.
+ * Used for the initial creation and for restarts after a fault.
+ */
+static void zephyr_domain_thread_create(struct k_thread *thread, int core)
+{
+	char thread_name[] = "ll_thread0";
+
+	k_thread_create(thread, ll_sched_stack[core], ZEPHYR_LL_STACK_SIZE,
+			zephyr_domain_thread_fn, zephyr_domain_kptr,
+			INT_TO_POINTER(core), NULL, CONFIG_LL_THREAD_PRIORITY,
+			K_USER, K_FOREVER);
+
+#ifdef CONFIG_SCHED_CPU_MASK
+	k_thread_cpu_pin(thread, core);
+#endif
+	thread_name[sizeof(thread_name) - 2] = '0' + core;
+	k_thread_name_set(thread, thread_name);
+
+	k_mem_domain_add_thread(zephyr_ll_mem_domain(), thread);
+}
+
+/* Work queue context: re-create a core's LL thread after it was aborted */
+static void zephyr_domain_thread_restart_work(struct k_work *work)
+{
+	int core = work - ll_restart_work;
+	struct k_thread *thread = ll_thread_tid[core];
+	struct k_thread *holder = ll_perm_holder[core];
+	struct k_sem *sem = ll_thread_ksem[core];
+	struct k_heap *pool;
+
+	if (!thread || !holder || !sem)
+		return;
+
+	/* the thread is aborted after the fatal error handler returns */
+	k_thread_join(thread, K_FOREVER);
+
+	/* drop the timer ticks given while there was no thread */
+	k_sem_reset(sem);
+
+	/* k_thread_create() takes the resource pool of the creating thread */
+	pool = thread->resource_pool;
+	zephyr_domain_thread_create(thread, core);
+	thread->resource_pool = pool;
+
+	/*
+	 * Restore the permissions of the aborted thread. The holder keeps
+	 * them: clearing them would also drop its access to itself.
+	 */
+	k_thread_perms_inherit(holder, thread);
+
+	k_thread_start(thread);
+
+	tr_warn(&ll_tr, "core %d: LL thread restarted", core);
+}
+
+int zephyr_domain_thread_core(const struct k_thread *thread)
+{
+	int core;
+
+	for (core = 0; core < CONFIG_CORE_COUNT; core++)
+		if (thread && ll_thread_tid[core] == thread)
+			return core;
+
+	return -1;
+}
+
+void zephyr_domain_thread_restart(int core)
+{
+	struct k_thread *thread;
+
+	if (core < 0 || core >= CONFIG_CORE_COUNT)
+		return;
+
+	thread = ll_thread_tid[core];
+
+	if (!thread || thread != k_current_get() || !ll_perm_holder[core]) {
+		tr_err(&ll_tr, "core %d: LL thread cannot be restarted", core);
+		return;
+	}
+
+	/* the abort clears the thread's permissions, save them first */
+	k_thread_perms_inherit(thread, ll_perm_holder[core]);
+
+	k_work_submit_to_queue(&ll_recovery_wq, &ll_restart_work[core]);
+
+	tr_err(&ll_tr, "core %d: LL thread faulted, restarting", core);
+}
+
+/*
  * Privileged thread initialization for userspace LL scheduling.
  * Creates the scheduling thread, sets up timer, grants access to kernel
  * objects. Must be called from kernel context before any user-space
@@ -229,7 +347,7 @@ static int zephyr_domain_thread_init(struct ll_schedule_domain *domain,
 	/* kernel context: do not take the domain data from user memory */
 	struct zephyr_domain *zephyr_domain = zephyr_domain_kptr;
 	struct zephyr_domain_thread *dt;
-	char thread_name[] = "ll_thread0";
+	struct k_thread *holder;
 	struct k_sem *sem;
 	k_tid_t thread;
 	int core = task->core;
@@ -259,8 +377,6 @@ static int zephyr_domain_thread_init(struct ll_schedule_domain *domain,
 	k_sem_init(sem, 0, 10);
 	dt->sem = sem;
 
-	thread_name[sizeof(thread_name) - 2] = '0' + core;
-
 	/*
 	 * Allocate thread structure dynamically. Keep the handle in a local:
 	 * the domain is user-writable, so dt->ll_thread must not be read back
@@ -274,10 +390,7 @@ static int zephyr_domain_thread_init(struct ll_schedule_domain *domain,
 		return -ENOMEM;
 	}
 
-	k_thread_create(thread, ll_sched_stack[core], ZEPHYR_LL_STACK_SIZE,
-			zephyr_domain_thread_fn, zephyr_domain,
-			INT_TO_POINTER(core), NULL, CONFIG_LL_THREAD_PRIORITY,
-			K_USER, K_FOREVER);
+	zephyr_domain_thread_create(thread, core);
 
 	/* record in the kernel-only tables for syscall-context lookups */
 	ll_thread_tid[core] = thread;
@@ -285,12 +398,18 @@ static int zephyr_domain_thread_init(struct ll_schedule_domain *domain,
 	sof_sysuser_thread_set(SOF_SYSUSER_LL, core, thread);
 	dt->ll_thread = thread;
 
-#ifdef CONFIG_SCHED_CPU_MASK
-	k_thread_cpu_pin(thread, core);
-#endif
-	k_thread_name_set(thread, thread_name);
+	/* without a holder the LL thread is not restarted after a fault */
+	holder = k_object_alloc(K_OBJ_THREAD);
+	if (holder) {
+		/* keep the holder, LL thread and semaphore objects alive */
+		k_object_access_grant(holder, holder);
+		k_object_access_grant(thread, holder);
+		k_object_access_grant(sem, holder);
+		ll_perm_holder[core] = holder;
+	} else {
+		tr_warn(&ll_tr, "no LL fault recovery on core %d", core);
+	}
 
-	k_mem_domain_add_thread(zephyr_ll_mem_domain(), thread);
 	k_thread_access_grant(thread, sem, domain->lock, zephyr_domain->timer);
 	user_grant_dai_access_all(thread);
 	user_grant_dma_access_all(thread);
@@ -360,6 +479,13 @@ static void zephyr_domain_thread_free(struct ll_schedule_domain *domain,
 		k_thread_abort(thread);
 		k_object_free(thread);
 		dt->ll_thread = NULL;
+	}
+
+	if (ll_perm_holder[core]) {
+		struct k_thread *holder = ll_perm_holder[core];
+
+		ll_perm_holder[core] = NULL;
+		k_object_free(holder);
 	}
 
 	if (ll_thread_ksem[core]) {
@@ -482,6 +608,16 @@ struct ll_schedule_domain *zephyr_domain_init(int clk)
 	ll_sch_domain_set_pdata(domain, zephyr_domain);
 #ifdef CONFIG_SOF_USERSPACE_LL
 	zephyr_domain_kptr = zephyr_domain;
+
+	/* restarts LL threads after faults, see zephyr_domain_thread_restart() */
+	k_work_queue_init(&ll_recovery_wq);
+	k_work_queue_start(&ll_recovery_wq, ll_recovery_stack,
+			   K_KERNEL_STACK_SIZEOF(ll_recovery_stack),
+			   CONFIG_LL_THREAD_PRIORITY, NULL);
+	k_thread_name_set(k_work_queue_thread_get(&ll_recovery_wq), "ll_recovery");
+
+	for (core = 0; core < CONFIG_CORE_COUNT; core++)
+		k_work_init(&ll_restart_work[core], zephyr_domain_thread_restart_work);
 #endif
 
 	for (core = 0; core < CONFIG_CORE_COUNT; core++) {

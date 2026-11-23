@@ -576,6 +576,25 @@ struct k_thread *zephyr_domain_thread_tid(struct ll_schedule_domain *domain);
 struct k_thread *zephyr_domain_thread_tid_for_core(int core);
 
 /**
+ * @brief Find the core whose LL scheduling thread is the given thread.
+ *
+ * Kernel context only.
+ * @param[in] thread Thread to look up.
+ * @return Core ID, or -1 if the thread is not an LL scheduling thread.
+ */
+int zephyr_domain_thread_core(const struct k_thread *thread);
+
+/**
+ * @brief Request a restart of a core's LL scheduling thread after a fault.
+ *
+ * Only for the fatal error handler, while the faulting LL thread is still
+ * current. Saves the thread's kernel object permissions and queues the
+ * restart, which is done once the thread has been aborted.
+ * @param[in] core Core ID of the faulting LL thread.
+ */
+void zephyr_domain_thread_restart(int core);
+
+/**
  * @brief Retrieve the user-space LL memory domain.
  * @return Pointer to k_mem_domain.
  */

@@ -20,6 +20,7 @@
 #include <rtos/task.h>
 #include <sof/trace/trace.h>
 #include <user/trace.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <ipc4/base_fw.h>
 
@@ -93,6 +94,27 @@ struct k_heap;
  * @return Pointer to the k_heap instance.
  */
 struct k_heap *zephyr_ll_user_heap(void);
+
+/**
+ * @brief Check whether the LL thread faulted while running a task.
+ *
+ * A faulted task has been cancelled by the fault handler and can no longer
+ * be scheduled.
+ * @param[in] task Target task.
+ * @return true if the task faulted.
+ */
+bool zephyr_ll_task_is_faulted(const struct task *task);
+
+static inline bool ll_task_is_faulted(const struct task *task)
+{
+	return task && zephyr_ll_task_is_faulted(task);
+}
+#else
+static inline bool ll_task_is_faulted(const struct task *task)
+{
+	(void)task;
+	return false;
+}
 #endif /* CONFIG_SOF_USERSPACE_LL */
 
 /* ll tracing */

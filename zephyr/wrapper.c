@@ -361,20 +361,22 @@ static bool sof_boot_test_fault_expected(void)
 
 #if defined(CONFIG_XTENSA) && defined(CONFIG_USERSPACE)
 /**
- * @brief Release kernel resources the faulting user thread still holds.
+ * @brief Recover from a fault of a user thread, before it is aborted.
  *
  * Called from k_sys_fatal_error_handler() before returning to
  * z_fatal_error(), which then aborts only the faulting user thread.
  * Zephyr does not release mutexes of aborted threads, so locks the thread
  * holds, e.g. the per-core LL scheduler lock, must be released here or
- * their waiters pend forever.
+ * their waiters pend forever. If the thread is an LL scheduler thread, the
+ * task it was running is quarantined and the thread is restarted once it
+ * has been aborted, so LL scheduling continues on that core.
  *
  * @return Number of locks released.
  */
-static int sof_user_fault_release_locks(void)
+static int sof_user_fault_recover(void)
 {
 #if CONFIG_SOF_USERSPACE_LL
-	return zephyr_ll_release_locks_of_current();
+	return zephyr_ll_fault_recover_current();
 #else
 	return 0;
 #endif
@@ -403,7 +405,7 @@ void k_sys_fatal_error_handler(unsigned int reason,
 		 */
 		if (reason == K_ERR_KERNEL_OOPS && _current &&
 		    k_thread_is_user_thread(_current)) {
-			int n = sof_user_fault_release_locks();
+			int n = sof_user_fault_recover();
 
 			LOG_ERR("ERROR: kernel oops from user thread %p; released %d locks; "
 				"aborting thread.", _current, n);
@@ -411,7 +413,7 @@ void k_sys_fatal_error_handler(unsigned int reason,
 		}
 
 		if (reason != K_ERR_KERNEL_PANIC && xtensa_exception_is_user(esf)) {
-			int n = sof_user_fault_release_locks();
+			int n = sof_user_fault_recover();
 
 			LOG_ERR("ERROR: Unexpected fatal error %u in Xtensa user mode; "
 				"released %d locks; aborting thread.", reason, n);
