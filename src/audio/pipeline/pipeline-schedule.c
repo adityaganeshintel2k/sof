@@ -269,6 +269,12 @@ static enum task_state ipc4_pipeline_trigger_task(void *arg)
 	enum task_state state;
 	struct pipeline *owner = delayed_trigger_owner[p->core];
 
+	/* the owner's trigger task faulted, it will never release ownership */
+	if (owner && owner != p && pipeline_is_faulted(owner)) {
+		delayed_trigger_owner[p->core] = NULL;
+		owner = NULL;
+	}
+
 	/* some other trigger task is still waiting for its delayed trigger */
 	if (owner && owner != p)
 		return SOF_TASK_STATE_RESCHEDULE;
@@ -315,6 +321,10 @@ static enum task_state ipc4_pipeline_copy_task(void *arg)
 	int err;
 
 	pipe_dbg(p, "entry");
+
+	/* the trigger task faulted, the pipeline can no longer run */
+	if (pipeline_is_faulted(p))
+		return SOF_TASK_STATE_COMPLETED;
 
 	/* are we in xrun ? */
 	if (p->xrun_bytes) {

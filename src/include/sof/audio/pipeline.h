@@ -20,6 +20,7 @@
 #include <rtos/sof.h>
 #include <rtos/spinlock.h>
 #include <sof/audio/pipeline-trace.h>
+#include <sof/schedule/ll_schedule.h>
 #include <ipc/topology.h>
 #include <user/trace.h>
 #include <errno.h>
@@ -383,6 +384,23 @@ static inline bool pipeline_is_same_sched_comp(struct pipeline *current,
 static inline bool pipeline_is_timer_driven(struct pipeline *p)
 {
 	return p->time_domain == SOF_TIME_DOMAIN_TIMER;
+}
+
+/**
+ * \brief Checks if the LL scheduler thread faulted running a pipeline task.
+ *
+ * A faulted pipeline cannot be started again. It can still be paused,
+ * stopped, reset and freed, which is done without its LL tasks.
+ * \param[in] p Target pipeline.
+ * \return True if a pipeline task faulted, false otherwise.
+ */
+static inline bool pipeline_is_faulted(struct pipeline *p)
+{
+#ifdef CONFIG_IPC_MAJOR_4
+	if (ll_task_is_faulted(p->trigger_task))
+		return true;
+#endif
+	return ll_task_is_faulted(p->pipe_task);
 }
 
 /**

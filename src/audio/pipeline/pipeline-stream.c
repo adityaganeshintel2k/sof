@@ -381,6 +381,41 @@ static void pipeline_cps_rebalance(struct pipeline *p, bool starting)
 #endif /* CONFIG_KCPS_DYNAMIC_CLOCK_CONTROL */
 
 /* trigger pipeline in IPC context */
+/*
+ * Trigger a pipeline, whose LL task faulted. Its tasks cannot run any more, so
+ * it can only be stopped, which is done inline, like for a paused pipeline.
+ * The host can then reset and free it.
+ */
+static int pipeline_trigger_faulted(struct pipeline *p, struct comp_dev *host, int cmd)
+{
+	int ret;
+
+	switch (cmd) {
+	case COMP_TRIGGER_PAUSE:
+	case COMP_TRIGGER_STOP:
+		break;
+	default:
+		pipe_err(p, "pipeline faulted, cannot run trigger cmd %d", cmd);
+		return -EIO;
+	}
+
+#if CONFIG_SOF_USERSPACE_LL
+	/* LL tasks of connected pipelines may still run */
+	user_ll_lock_sched(p->core);
+#endif
+	ret = pipeline_trigger_run(p, host, cmd);
+#if CONFIG_SOF_USERSPACE_LL
+	user_ll_unlock_sched(p->core);
+#endif
+	if (ret < 0)
+		return ret;
+
+	p->status = COMP_STATE_PAUSED;
+	telemetry_notify_pipeline_change();
+
+	return 0;
+}
+
 int pipeline_trigger(struct pipeline *p, struct comp_dev *host, int cmd)
 {
 	int ret;
@@ -391,6 +426,9 @@ int pipeline_trigger(struct pipeline *p, struct comp_dev *host, int cmd)
 	pipe_info(p, "pipe trigger cmd %d", cmd);
 
 	p->trigger.aborted = false;
+
+	if (pipeline_is_faulted(p))
+		return pipeline_trigger_faulted(p, host, cmd);
 
 	switch (cmd) {
 	case COMP_TRIGGER_PAUSE:
