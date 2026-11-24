@@ -200,6 +200,10 @@ struct vol_data {
 	uint32_t attenuation;			/**< peakmeter adjustment in range [0 - 31] */
 	bool is_passthrough;			/**< is passthrough or do gain multiplication */
 	uint32_t ramp_channel_counter;		/**< channels need new ramp volume */
+#if CONFIG_COMP_GAIN_DP_FAULT_INJECT
+	/**< DEBUG ONLY: process() calls as DP, see gain_process_fault_inject() */
+	uint32_t dp_fault_inject_count;
+#endif
 };
 
 /** \brief Volume processing functions map. */

@@ -195,6 +195,17 @@ static inline int comp_trigger_local(struct comp_dev *dev, int cmd)
 {
 	int ret;
 
+#if CONFIG_ZEPHYR_DP_SCHEDULER
+	/*
+	 * A DP module only loses its task when its DP thread has faulted, see
+	 * scheduler_dp_thread_faulted(). It can't process any more, so it must
+	 * not be started again: only stopping and deleting it is allowed.
+	 */
+	if ((cmd == COMP_TRIGGER_START || cmd == COMP_TRIGGER_RELEASE) &&
+	    dev->ipc_config.proc_domain == COMP_PROCESSING_DOMAIN_DP && !dev->task)
+		return -ENODEV;
+#endif
+
 	ret = dev->drv->ops.trigger(dev, cmd);
 	if (ret)
 		return ret;

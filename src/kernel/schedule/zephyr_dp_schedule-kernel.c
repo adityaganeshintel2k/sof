@@ -58,6 +58,26 @@ void scheduler_dp_grant(k_tid_t thread_id, uint16_t core)
 		k_thread_access_grant(thread_id, &dp_lock[core]);
 }
 
+#if CONFIG_SOF_USERSPACE_APPLICATION
+#define DP_FREE_LOCK_INIT(i, _)	Z_MUTEX_INITIALIZER(dp_free_lock[i])
+#define DP_FREE_LOCK_INIT_LIST	LISTIFY(CONFIG_CORE_COUNT, DP_FREE_LOCK_INIT, (,))
+
+/*
+ * Serializes freeing a DP task between the DP fault recovery work and the
+ * module delete path, see scheduler_dp_free_lock(). Placed in the iterable
+ * section so gen_kobject_list.py treats it as an initialized kernel object.
+ */
+STRUCT_SECTION_ITERABLE_ARRAY(k_mutex, dp_free_lock, CONFIG_CORE_COUNT) = {
+	DP_FREE_LOCK_INIT_LIST
+};
+
+void scheduler_dp_free_lock_grant(k_tid_t thread_id, uint16_t core)
+{
+	if (thread_id)
+		k_thread_access_grant(thread_id, &dp_free_lock[core]);
+}
+#endif /* CONFIG_SOF_USERSPACE_APPLICATION */
+
 /* dummy LL task - to start LL on secondary cores */
 static enum task_state scheduler_dp_ll_tick_dummy(void *data)
 {
@@ -300,6 +320,13 @@ __cold int scheduler_dp_init(void)
 	list_init(&dp_sch->tasks);
 
 	scheduler_init(SOF_SCHEDULE_DP, &schedule_dp_ops, dp_sch);
+
+#if CONFIG_SOF_USERSPACE_APPLICATION
+	int ret = scheduler_dp_fault_wq_init();
+
+	if (ret < 0)
+		return ret;
+#endif
 
 	/* init src of DP tick */
 	return schedule_task_init_ll(&dp_sch->ll_tick_src,

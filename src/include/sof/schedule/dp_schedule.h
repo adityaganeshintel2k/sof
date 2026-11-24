@@ -32,6 +32,7 @@
 #include <rtos/task.h>
 #include <sof/trace/trace.h>
 #include <user/trace.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <ipc4/base_fw.h>
 #include <ipc4/module.h>
@@ -151,6 +152,49 @@ static inline void scheduler_dp_check_deadline(uint16_t core, uint32_t deadline_
  * @param[in] core Core ID of the calling LL scheduler.
  */
 void scheduler_dp_ll_post_tick(unsigned int core);
+
+#if CONFIG_ZEPHYR_DP_SCHEDULER && CONFIG_SOF_USERSPACE_APPLICATION
+/**
+ * @brief Report that a user thread faulted, if it is a DP thread.
+ *
+ * Called from k_sys_fatal_error_handler() for a user-mode fault, while
+ * @p thread is still the current thread and before z_fatal_error() aborts it.
+ * If @p thread is a DP thread, its DP task is marked as faulted and its
+ * resources are released later by the recovery work queue of its core. Nothing
+ * is freed here, so this is safe to call in exception context.
+ *
+ * @param[in] thread The faulting thread.
+ * @return true if @p thread is a DP thread, false otherwise.
+ */
+bool scheduler_dp_thread_faulted(k_tid_t thread);
+
+/**
+ * @brief Take the per-core lock serializing DP task freeing.
+ *
+ * Held by the DP fault recovery work and by pipeline_comp_dp_task_free(), so
+ * that a DP task is freed exactly once when the host deletes a module whose DP
+ * thread has faulted.
+ *
+ * @param[in] core Core of the DP task.
+ */
+void scheduler_dp_free_lock(uint16_t core);
+
+/**
+ * @brief Release the lock taken by scheduler_dp_free_lock().
+ * @param[in] core Core of the DP task.
+ */
+void scheduler_dp_free_unlock(uint16_t core);
+#else
+static inline void scheduler_dp_free_lock(uint16_t core)
+{
+	(void)core;
+}
+
+static inline void scheduler_dp_free_unlock(uint16_t core)
+{
+	(void)core;
+}
+#endif
 
 #if CONFIG_SOF_BOOT_TEST_STANDALONE && CONFIG_SOF_USERSPACE_APPLICATION
 /* Test hooks: add and remove kernel-only DP task records without a DP task */

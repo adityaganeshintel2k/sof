@@ -79,4 +79,24 @@ config COMP_GAIN
 	  This option enables gain to change volume. It works
 	  as peak volume without updating peak vol to host
 
+config COMP_GAIN_DP_FAULT_INJECT
+	bool "DEBUG: fault in GAIN process() when it runs as DP"
+	default n
+	depends on COMP_GAIN && ZEPHYR_DP_SCHEDULER
+	help
+	  DEBUG ONLY, never enable in production. A GAIN instance in the
+	  DP processing domain executes an illegal instruction in its
+	  process() function after COMP_GAIN_DP_FAULT_INJECT_PERIODS
+	  calls, to test the recovery from a faulting DP thread. Use a
+	  topology that sets scheduler_domain "DP" on a gain widget.
+
+config COMP_GAIN_DP_FAULT_INJECT_PERIODS
+	int "GAIN process() calls before the injected fault"
+	default 1000
+	range 1 1000000
+	depends on COMP_GAIN_DP_FAULT_INJECT
+	help
+	  Number of process() calls of a GAIN instance running as DP
+	  before it executes the illegal instruction.
+
 endif # volume

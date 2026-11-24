@@ -174,6 +174,57 @@ static void ipc_thread_unflatten_run(struct processing_module *pmod, struct ipc4
 
 #define DP_THREAD_IPC_TIMEOUT K_MSEC(100)
 
+/*
+ * Result of an IPC to a module whose DP thread has faulted. Its DP task is
+ * freed by the DP fault recovery, see scheduler_dp_thread_faulted(), so the
+ * IPC can't reach a DP thread. Teardown succeeds, so the host can stop,
+ * unbind and delete the module and then create it again, anything else fails.
+ */
+static int scheduler_dp_faulted_ipc_ret(struct processing_module *pmod, unsigned int cmd,
+					const union scheduler_dp_thread_ipc_param *param)
+{
+	int ret = -ENODEV;
+
+	/* check cmd first, param is NULL for SOF_IPC4_MOD_DELETE_INSTANCE */
+	switch (cmd) {
+	case SOF_IPC4_MOD_UNBIND:
+	case SOF_IPC4_MOD_DELETE_INSTANCE:
+		ret = 0;
+		break;
+	case SOF_IPC4_GLB_SET_PIPELINE_STATE:
+		switch (param->pipeline_state.trigger_cmd) {
+		case COMP_TRIGGER_STOP:
+		case COMP_TRIGGER_PAUSE:
+		case COMP_TRIGGER_RESET:
+		case COMP_TRIGGER_XRUN:
+			ret = 0;
+			break;
+		default:
+			break;
+		}
+		break;
+	default:
+		break;
+	}
+
+	comp_warn(pmod->dev, "DP thread faulted, IPC %#x returns %d", cmd, ret);
+
+	return ret;
+}
+
+/*
+ * Whether the DP thread of @pmod has faulted and its DP task has been freed.
+ * The DP task is created before the first DP thread IPC and only freed by the
+ * module delete path, after the last one, or by the DP fault recovery, which
+ * clears pmod->dev->task before freeing it. The recovery work runs on the core
+ * of the module, below the IPC thread priority, so it can only free the task
+ * while this thread is blocked: check again after each blocking call.
+ */
+static bool scheduler_dp_task_faulted(struct processing_module *pmod)
+{
+	return !pmod->dev->task;
+}
+
 /* Signal an IPC and wait for processing completion */
 int scheduler_dp_thread_ipc(struct processing_module *pmod, unsigned int cmd,
 			    union scheduler_dp_thread_ipc_param *param)
@@ -189,6 +240,9 @@ int scheduler_dp_thread_ipc(struct processing_module *pmod, unsigned int cmd,
 		return -EINVAL;
 	}
 
+	if (scheduler_dp_task_faulted(pmod))
+		return scheduler_dp_faulted_ipc_ret(pmod, cmd, param);
+
 	if (k_is_user_context()) {
 		struct task_dp_pdata *pdata = pmod->dev->task->priv_data;
 
@@ -201,7 +255,11 @@ int scheduler_dp_thread_ipc(struct processing_module *pmod, unsigned int cmd,
 		 * The module and its task memory are writable by user threads,
 		 * so the kernel takes the DP task objects from its own record.
 		 */
-		if (scheduler_dp_task_ipc_params(pmod, &event, &flat, &config_data, &core)) {
+		ret = scheduler_dp_task_ipc_params(pmod, &event, &flat, &config_data, &core);
+		if (ret == -ENODEV)
+			/* faulted, the DP task isn't freed yet */
+			return scheduler_dp_faulted_ipc_ret(pmod, cmd, param);
+		if (ret) {
 			tr_err(&dp_tr, "no DP task for module");
 			return -EINVAL;
 		}
@@ -210,6 +268,8 @@ int scheduler_dp_thread_ipc(struct processing_module *pmod, unsigned int cmd,
 	if (cmd == SOF_IPC4_MOD_INIT_INSTANCE) {
 		/* Wait for the DP thread to start */
 		ret = k_sem_take(&dp_sync[core], DP_THREAD_IPC_TIMEOUT);
+		if (scheduler_dp_task_faulted(pmod))
+			return scheduler_dp_faulted_ipc_ret(pmod, cmd, param);
 		if (ret < 0) {
 			tr_err(&dp_tr, "Failed waiting for DP thread to start: %d", ret);
 			return ret;
@@ -217,6 +277,12 @@ int scheduler_dp_thread_ipc(struct processing_module *pmod, unsigned int cmd,
 	}
 
 	unsigned int lock_key = scheduler_dp_lock(core);
+
+	/* the fault recovery may have freed the task while waiting for the lock */
+	if (scheduler_dp_task_faulted(pmod)) {
+		scheduler_dp_unlock(lock_key);
+		return scheduler_dp_faulted_ipc_ret(pmod, cmd, param);
+	}
 
 	/* IPCs are serialised */
 	flat->ret = -ENOSYS;
@@ -232,6 +298,9 @@ int scheduler_dp_thread_ipc(struct processing_module *pmod, unsigned int cmd,
 
 	/* Wait for completion */
 	ret = k_sem_take(&dp_sync[core], DP_THREAD_IPC_TIMEOUT);
+	/* a DP thread that faulted meanwhile never completes it, its task memory is freed */
+	if (scheduler_dp_task_faulted(pmod))
+		return scheduler_dp_faulted_ipc_ret(pmod, cmd, param);
 	if (ret < 0) {
 		tr_err(&dp_tr, "Failed waiting for DP thread: %d", ret);
 		return ret;

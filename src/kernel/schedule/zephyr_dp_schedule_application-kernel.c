@@ -42,11 +42,42 @@ extern struct tr_ctx dp_tr;
  */
 
 static struct objpool_head dp_mdom_head = {.list = LIST_INIT(dp_mdom_head.list)};
+/*
+ * Protects dp_mdom_head. objpool_alloc() and objpool_free() update the pool
+ * without locking. DP task creation and the module delete path are serialized
+ * by IPC processing, but the DP fault recovery work frees domains outside of
+ * it, concurrently with a DP module being created on another core.
+ */
+static K_MUTEX_DEFINE(dp_mdom_lock);
+
+static struct k_mem_domain *dp_mdom_alloc(void)
+{
+	struct k_mem_domain *mdom;
+
+	k_mutex_lock(&dp_mdom_lock, K_FOREVER);
+	mdom = objpool_alloc(&dp_mdom_head, sizeof(*mdom), SOF_MEM_FLAG_COHERENT);
+	k_mutex_unlock(&dp_mdom_lock);
+
+	return mdom;
+}
+
+static void dp_mdom_free(struct k_mem_domain *mdom)
+{
+	k_mutex_lock(&dp_mdom_lock, K_FOREVER);
+	objpool_free(&dp_mdom_head, mdom);
+	k_mutex_unlock(&dp_mdom_lock);
+}
 
 /* Synchronization semaphore for the scheduler thread to wait for DP startup */
 #define DP_SYNC_INIT(i, _)	Z_SEM_INITIALIZER(dp_sync[i], 0, 1)
 #define DP_SYNC_INIT_LIST	LISTIFY(CONFIG_CORE_COUNT, DP_SYNC_INIT, (,))
 STRUCT_SECTION_ITERABLE_ARRAY(k_sem, dp_sync, CONFIG_CORE_COUNT) = { DP_SYNC_INIT_LIST };
+
+/* State of a DP task record */
+enum scheduler_dp_task_kobj_state {
+	DP_KOBJ_ALIVE = 0,	/* the DP thread is running, 0 so zeroed records are alive */
+	DP_KOBJ_FAULTED,	/* the DP thread faulted, queued for the fault recovery */
+};
 
 /*
  * Kernel-only record of the kernel objects owned by a DP task.
@@ -61,8 +92,11 @@ struct scheduler_dp_task_kobj {
 	struct list_item list;
 	struct task *task;
 	struct processing_module *mod;
+	struct comp_dev *dev;		/* mod->dev at creation, mod is writable by user threads */
+	const struct comp_driver *orig_drv; /* mod->dev->drv before it was pointed at the copy */
 	struct k_event *event;
 	struct k_thread *thread;
+	k_thread_stack_t *stack;	/* the DP thread stack, pdata->p_stack is user-writable */
 	struct ipc4_flat *flat;		/* IPC parameter area in task memory */
 	void *config_data;		/* LARGE_CONFIG_GET reply buffer in task memory */
 	struct k_mem_domain *mdom;
@@ -70,7 +104,25 @@ struct scheduler_dp_task_kobj {
 	uint32_t comp_id;
 	uint16_t core;
 	uint32_t gen;			/* unique per record, see dp_task_kobj_take() */
+	enum scheduler_dp_task_kobj_state state;
+	struct list_item faulted;	/* in dp_fault_wq::faulted while DP_KOBJ_FAULTED */
 };
+
+/*
+ * Per-core DP fault recovery work queue. Allocated from the kernel heap, not
+ * defined statically, so that its thread isn't a kernel object and doesn't
+ * use one of the few thread permission indices.
+ */
+struct dp_fault_wq {
+	struct k_work_q q;
+	struct k_work work;
+	struct list_item faulted;	/* faulted DP task records, under dp_task_kobj_lock */
+	uint16_t core;
+};
+
+static struct dp_fault_wq *dp_fault_wq[CONFIG_CORE_COUNT];
+static K_KERNEL_STACK_ARRAY_DEFINE(dp_fault_wq_stack, CONFIG_CORE_COUNT,
+				   CONFIG_ZEPHYR_DP_FAULT_WQ_STACK_SIZE);
 
 static struct list_item dp_task_kobj_list = LIST_INIT(dp_task_kobj_list);
 static struct k_spinlock dp_task_kobj_lock;
@@ -95,6 +147,21 @@ static struct scheduler_dp_task_kobj *dp_task_kobj_find(const struct task *task)
 	list_for_item(item, &dp_task_kobj_list) {
 		kobj = container_of(item, struct scheduler_dp_task_kobj, list);
 		if (kobj->task == task)
+			return kobj;
+	}
+
+	return NULL;
+}
+
+/* Find the record of the DP thread @thread, caller holds dp_task_kobj_lock */
+static struct scheduler_dp_task_kobj *dp_task_kobj_find_thread(const struct k_thread *thread)
+{
+	struct scheduler_dp_task_kobj *kobj;
+	struct list_item *item;
+
+	list_for_item(item, &dp_task_kobj_list) {
+		kobj = container_of(item, struct scheduler_dp_task_kobj, list);
+		if (kobj->thread == thread)
 			return kobj;
 	}
 
@@ -156,8 +223,15 @@ dp_task_kobj_take(const struct task *task, const struct scheduler_dp_task_kobj *
 	if (kobj && expected && kobj->gen != expected->gen)
 		kobj = NULL;
 
-	if (kobj)
+	if (kobj) {
 		list_item_del(&kobj->list);
+		/*
+		 * A faulted record still queued for the fault recovery, the
+		 * recovery work must not find it after it is freed. A no-op
+		 * if it isn't queued: the item is then linked to itself.
+		 */
+		list_item_del(&kobj->faulted);
+	}
 
 	k_spin_unlock(&dp_task_kobj_lock, key);
 
@@ -200,7 +274,7 @@ static void scheduler_dp_domain_free(struct processing_module *pmod, struct k_me
 	/* All partitions removed, the domain can be freed now */
 	pmod->mdom = NULL;
 	k_mem_domain_deinit(mdom);
-	objpool_free(&dp_mdom_head, mdom);
+	dp_mdom_free(mdom);
 }
 
 /*
@@ -222,6 +296,8 @@ static bool scheduler_dp_internal_free_kobj(struct task *task,
 	k_object_free(kobj->thread);
 	scheduler_dp_domain_free(kobj->mod, kobj->mdom, kobj->mpart, kobj->comp_id);
 
+	/* mod->dev->drv points to the driver copy in the task memory freed next */
+	kobj->dev->drv = kobj->orig_drv;
 	mod_free(kobj->mod, container_of(task, struct scheduler_dp_task_memory, task));
 	rfree(kobj);
 
@@ -310,7 +386,8 @@ int scheduler_dp_task_init(struct task **task, const struct sof_uuid_entry *uid,
 	 * it into pdata for the DP thread.
 	 */
 	struct task_dp_pdata *pdata = &task_memory->pdata;
-	struct scheduler_dp_task_kobj *kobj = rmalloc(SOF_MEM_FLAG_KERNEL | SOF_MEM_FLAG_COHERENT,
+	/* zeroed: a new record is DP_KOBJ_ALIVE and fields added later start as NULL */
+	struct scheduler_dp_task_kobj *kobj = rzalloc(SOF_MEM_FLAG_KERNEL | SOF_MEM_FLAG_COHERENT,
 						      sizeof(*kobj));
 
 	if (!kobj) {
@@ -321,6 +398,12 @@ int scheduler_dp_task_init(struct task **task, const struct sof_uuid_entry *uid,
 
 	kobj->task = ptask;
 	kobj->mod = mod;
+	kobj->dev = mod->dev;
+	/* the fault recovery frees task_memory, it restores mod->dev->drv from here first */
+	kobj->orig_drv = drv;
+	/* the fault recovery frees the stack, pdata->p_stack can't be trusted then */
+	kobj->stack = p_stack;
+	list_init(&kobj->faulted);
 	kobj->core = core;
 	comp_id = mod->dev->ipc_config.id;
 	kobj->comp_id = comp_id;
@@ -395,11 +478,12 @@ int scheduler_dp_task_init(struct task **task, const struct sof_uuid_entry *uid,
 
 	k_thread_access_grant(thread_ipc, kobj->event, thread_id, p_stack, &dp_sync[core]);
 	scheduler_dp_grant(thread_ipc, core);
+	/* the IPC user thread frees DP tasks, see pipeline_comp_dp_task_free() */
+	scheduler_dp_free_lock_grant(thread_ipc, core);
 	scheduler_dp_grant(zephyr_ll_domain_thread(), core);
 #endif
 
-	struct k_mem_domain *mdom = objpool_alloc(&dp_mdom_head, sizeof(*mdom),
-						  SOF_MEM_FLAG_COHERENT);
+	struct k_mem_domain *mdom = dp_mdom_alloc();
 
 	if (!mdom) {
 		tr_err(&dp_tr, "objpool allocation failed");
@@ -483,7 +567,7 @@ e_dom:
 	on_pool = false;
 e_thread:
 	if (on_pool)
-		objpool_free(&dp_mdom_head, mdom);
+		dp_mdom_free(mdom);
 	k_thread_abort(thread_id);
 	k_object_free(kobj->thread);
 e_event:
@@ -503,7 +587,8 @@ e_tmem:
 
 /*
  * Get the objects needed to send an IPC to the DP thread of @mod from the
- * kernel-only record. Returns -EINVAL if @mod has no DP task.
+ * kernel-only record. Returns -EINVAL if @mod has no DP task, -ENODEV if its
+ * DP thread has faulted.
  */
 int scheduler_dp_task_ipc_params(const struct processing_module *mod, struct k_event **event,
 				 struct ipc4_flat **flat, const void **config_data,
@@ -513,6 +598,9 @@ int scheduler_dp_task_ipc_params(const struct processing_module *mod, struct k_e
 
 	if (!dp_task_kobj_peek_mod(mod, &kobj))
 		return -EINVAL;
+
+	if (kobj.state != DP_KOBJ_ALIVE)
+		return -ENODEV;
 
 	*event = kobj.event;
 	*flat = kobj.flat;
@@ -536,7 +624,8 @@ int z_impl_scheduler_dp_kick(const struct scheduler_dp_kick *kicks, uint32_t cou
 
 	for (i = 0; i < count; i++) {
 		kobj = dp_task_kobj_find(kicks[i].task);
-		if (!kobj || kobj->core != core) {
+		/* a faulted DP thread is dead, its objects are about to be freed */
+		if (!kobj || kobj->core != core || kobj->state != DP_KOBJ_ALIVE) {
 			skipped++;
 			continue;
 		}
@@ -571,13 +660,308 @@ unsigned int scheduler_dp_task_count(unsigned int core)
 	 */
 	list_for_item(item, &dp_task_kobj_list) {
 		kobj = container_of(item, struct scheduler_dp_task_kobj, list);
-		if (kobj->core == core && task_is_active(kobj->task))
+		if (kobj->core == core && kobj->state == DP_KOBJ_ALIVE &&
+		    task_is_active(kobj->task))
 			count++;
 	}
 
 	k_spin_unlock(&dp_task_kobj_lock, key);
 
 	return count;
+}
+
+/*
+ * DP fault recovery
+ *
+ * When a DP thread faults, k_sys_fatal_error_handler() calls
+ * scheduler_dp_thread_faulted() and z_fatal_error() then aborts the thread.
+ * scheduler_dp_thread_faulted() only marks the record of the thread faulted and
+ * queues it on the recovery work queue of its core. The work then runs the task
+ * part of the module delete path, see scheduler_dp_task_free(), on the dead
+ * thread: it removes the task from the DP scheduler, joins the thread, frees
+ * its stack, its kernel objects, its memory domain, the task memory and the
+ * record. The module itself stays until the host deletes it. Its IPCs then
+ * don't reach a DP thread any more, see scheduler_dp_thread_ipc().
+ */
+
+/* A faulted DP thread is aborted before the fatal error handler returns */
+#define DP_FAULT_JOIN_TIMEOUT_MS	10
+
+/* DP scheduler data of the calling core, kernel context */
+static struct scheduler_dp_data *dp_fault_sch_get(void)
+{
+#if CONFIG_SOF_USERSPACE_LL
+	/* the kernel-only copy, user threads can write the published one */
+	struct schedulers **schedulers = arch_user_schedulers_get();
+
+	return schedulers ? scheduler_list_get_data(*schedulers, SOF_SCHEDULE_DP) : NULL;
+#else
+	return scheduler_get_data(SOF_SCHEDULE_DP);
+#endif
+}
+
+/*
+ * Whether @node can be a neighbour of the task of the @faulted record in the
+ * DP task list of @dp_sch: the list head, or the list item of another DP task
+ * of the same core. The list items are in task memory, which user threads can
+ * write, so they are checked before the kernel writes through them. Caller
+ * holds dp_task_kobj_lock.
+ */
+static bool dp_fault_list_node_valid(struct scheduler_dp_data *dp_sch,
+				     const struct scheduler_dp_task_kobj *faulted,
+				     const struct list_item *node)
+{
+	struct scheduler_dp_task_kobj *kobj;
+	struct list_item *item;
+
+	if (node == &dp_sch->tasks)
+		return true;
+
+	list_for_item(item, &dp_task_kobj_list) {
+		kobj = container_of(item, struct scheduler_dp_task_kobj, list);
+		if (kobj != faulted && kobj->core == faulted->core &&
+		    node == &kobj->task->list)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Remove the faulted task from the DP scheduler, like scheduler_dp_task_stop().
+ *
+ * Unlike scheduler_dp_task_stop(), this doesn't cancel the DP tick source when
+ * the last DP task of the core is removed. That takes the LL scheduler lock,
+ * while the LL thread takes dp_lock with the LL scheduler lock held when it
+ * starts a DP task from a pipeline trigger: taking both here, asynchronously
+ * to IPC processing, could deadlock. The tick source then keeps running a
+ * dummy LL task until the next DP task of the core is stopped, scheduling it
+ * again for a new DP task is harmless.
+ */
+static void dp_fault_task_unlink(struct scheduler_dp_task_kobj *kobj)
+{
+	struct scheduler_dp_data *dp_sch = dp_fault_sch_get();
+	struct list_item *tlist = &kobj->task->list;
+	struct list_item *next, *prev;
+	unsigned int lock_key;
+	k_spinlock_key_t key;
+
+	if (!dp_sch) {
+		LOG_ERR("comp %#x: no DP scheduler on core %u", kobj->comp_id, kobj->core);
+		return;
+	}
+
+	lock_key = scheduler_dp_lock(kobj->core);
+
+	key = k_spin_lock(&dp_task_kobj_lock);
+
+	next = tlist->next;
+	prev = tlist->prev;
+
+	/* linked to itself if not scheduled */
+	if (next != tlist || prev != tlist) {
+		if (dp_fault_list_node_valid(dp_sch, kobj, next) &&
+		    dp_fault_list_node_valid(dp_sch, kobj, prev) &&
+		    next->prev == tlist && prev->next == tlist)
+			list_item_del(tlist);
+		else
+			LOG_ERR("comp %#x: DP task list corrupted, task not removed",
+				kobj->comp_id);
+	}
+
+	k_spin_unlock(&dp_task_kobj_lock, key);
+
+	kobj->task->state = SOF_TASK_STATE_CANCEL;
+
+	scheduler_dp_unlock(lock_key);
+}
+
+/*
+ * Free the DP task of a faulted DP thread. Called with the DP task freeing
+ * lock of its core held, after the record was taken off the faulted list.
+ */
+static void dp_fault_task_free(struct scheduler_dp_task_kobj *kobj)
+{
+	struct task *task = kobj->task;
+	struct comp_dev *dev = kobj->dev;
+	uint32_t comp_id = kobj->comp_id;
+	int ret;
+
+	/* 1. stop scheduling the task */
+	dp_fault_task_unlink(kobj);
+
+	/*
+	 * 2. scheduler_dp_task_stop() sets DP_TASK_EVENT_CANCEL here to make a
+	 * live DP thread exit, a dead one doesn't need it.
+	 *
+	 * 3. the thread was aborted before the fatal error handler returned, so
+	 * this returns at once. Required before freeing the thread and its stack.
+	 */
+	ret = k_thread_join(kobj->thread, K_MSEC(DP_FAULT_JOIN_TIMEOUT_MS));
+	if (ret < 0) {
+		LOG_ERR("comp %#x: faulted DP thread still alive (%d), aborting", comp_id, ret);
+		k_thread_abort(kobj->thread);
+	}
+
+	/* 4. the stack, from the record: pdata->p_stack is user-writable */
+	ret = user_stack_free(kobj->stack);
+	if (ret < 0)
+		LOG_ERR("comp %#x: DP thread stack free failed %d", comp_id, ret);
+	kobj->stack = NULL;
+
+	/*
+	 * 5. leave the module without a DP task, before anything the IPC thread
+	 * could still use is freed. The IPC thread can preempt this work: from
+	 * here on its DP thread IPCs return without using the task, and the
+	 * module delete path skips the task, see scheduler_dp_thread_ipc() and
+	 * pipeline_comp_dp_task_free().
+	 */
+	dev->task = NULL;
+
+	/*
+	 * 6. the thread and event objects, the memory domain, then the task
+	 * memory, after restoring mod->dev->drv, which points to the driver copy
+	 * in it, and the record.
+	 */
+	if (scheduler_dp_internal_free_kobj(task, NULL))
+		LOG_INF("comp %#x: faulted DP task freed", comp_id);
+	else
+		LOG_ERR("comp %#x: faulted DP task record not found", comp_id);
+}
+
+static void dp_fault_work_fn(struct k_work *work)
+{
+	struct dp_fault_wq *wq = CONTAINER_OF(work, struct dp_fault_wq, work);
+	struct scheduler_dp_task_kobj *kobj;
+	k_spinlock_key_t key;
+
+	do {
+		/*
+		 * Serialized with the module delete path, see
+		 * pipeline_comp_dp_task_free(): whichever frees the task first,
+		 * the other one doesn't find it any more. Take the record off
+		 * the faulted list only with the lock held, so it can't be
+		 * freed by the delete path meanwhile.
+		 */
+		scheduler_dp_free_lock(wq->core);
+
+		key = k_spin_lock(&dp_task_kobj_lock);
+		kobj = list_is_empty(&wq->faulted) ? NULL :
+			list_first_item(&wq->faulted, struct scheduler_dp_task_kobj, faulted);
+		if (kobj)
+			list_item_del(&kobj->faulted);
+		k_spin_unlock(&dp_task_kobj_lock, key);
+
+		if (kobj)
+			dp_fault_task_free(kobj);
+
+		scheduler_dp_free_unlock(wq->core);
+	} while (kobj);
+}
+
+int scheduler_dp_fault_wq_init(void)
+{
+	const struct k_work_queue_config cfg = {
+		.name = "dp_fault",
+	};
+	unsigned int core = cpu_get_id();
+	struct dp_fault_wq *wq;
+	k_spinlock_key_t key;
+	k_tid_t thread;
+	int ret;
+
+	if (dp_fault_wq[core])
+		return 0;
+
+	wq = rzalloc(SOF_MEM_FLAG_KERNEL | SOF_MEM_FLAG_COHERENT, sizeof(*wq));
+	if (!wq)
+		return -ENOMEM;
+
+	wq->core = core;
+	list_init(&wq->faulted);
+	k_work_init(&wq->work, dp_fault_work_fn);
+
+	/* above the DP threads, below LL, IPC and IDC */
+	k_work_queue_init(&wq->q);
+	k_work_queue_start(&wq->q, dp_fault_wq_stack[core],
+			   K_KERNEL_STACK_SIZEOF(dp_fault_wq_stack[core]),
+			   CONFIG_DP_THREAD_PRIORITY - 1, &cfg);
+
+	/* the work must run on the faulting core, see dp_fault_sch_get() */
+	thread = k_work_queue_thread_get(&wq->q);
+	k_thread_suspend(thread);
+#ifdef CONFIG_SCHED_CPU_MASK
+	ret = k_thread_cpu_pin(thread, core);
+#else
+	ret = 0;
+#endif
+	k_thread_resume(thread);
+
+	if (ret < 0) {
+		/* leave the queue idle, DP faults on this core won't be recovered */
+		LOG_ERR("DP fault work queue pin to core %u failed %d", core, ret);
+		return ret;
+	}
+
+	/* publish last, scheduler_dp_thread_faulted() reads it */
+	key = k_spin_lock(&dp_task_kobj_lock);
+	dp_fault_wq[core] = wq;
+	k_spin_unlock(&dp_task_kobj_lock, key);
+
+	return 0;
+}
+
+bool scheduler_dp_thread_faulted(k_tid_t thread)
+{
+	struct scheduler_dp_task_kobj *kobj;
+	struct dp_fault_wq *wq = NULL;
+	bool first_fault = false;
+	k_spinlock_key_t key;
+	uint32_t comp_id = 0;
+	bool dp_thread;
+
+	/*
+	 * Exception context on the faulting core. Other cores keep creating,
+	 * deleting and kicking DP tasks, so the record list is only walked
+	 * with dp_task_kobj_lock held. This core can't already hold it: the
+	 * fault came from user mode, and the kernel only holds the lock with
+	 * interrupts locked, outside of user code. Nothing is freed here, the
+	 * thread and its stack are still in use until z_fatal_error() aborts it.
+	 */
+	key = k_spin_lock(&dp_task_kobj_lock);
+
+	kobj = dp_task_kobj_find_thread(thread);
+	dp_thread = kobj != NULL;
+	if (kobj && kobj->state == DP_KOBJ_ALIVE) {
+		first_fault = true;
+		comp_id = kobj->comp_id;
+		wq = dp_fault_wq[kobj->core];
+		if (wq) {
+			kobj->state = DP_KOBJ_FAULTED;
+			list_item_append(&kobj->faulted, &wq->faulted);
+		}
+	}
+
+	k_spin_unlock(&dp_task_kobj_lock, key);
+
+	if (!first_fault)
+		return dp_thread;
+
+	if (wq) {
+		/*
+		 * Interrupts are locked here, so this doesn't reschedule. The
+		 * queue is pinned to this core: the work only runs after the
+		 * exception has returned, when the thread has been aborted.
+		 */
+		k_work_submit_to_queue(&wq->q, &wq->work);
+		LOG_ERR("DP thread %p of comp %#x faulted, freeing its DP task", thread, comp_id);
+	} else {
+		/* the delete path still frees it, the DP thread IPCs just time out */
+		LOG_ERR("DP thread %p of comp %#x faulted, no recovery work queue",
+			thread, comp_id);
+	}
+
+	return true;
 }
 
 #if CONFIG_SOF_BOOT_TEST_STANDALONE
@@ -595,6 +979,7 @@ int scheduler_dp_test_record_add(struct task *task, struct k_event *event,
 	kobj->event = event;
 	kobj->thread = thread;
 	kobj->core = core;
+	list_init(&kobj->faulted);
 	dp_task_kobj_add(kobj);
 
 	return 0;

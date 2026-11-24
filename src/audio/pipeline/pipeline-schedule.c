@@ -623,6 +623,26 @@ int pipeline_comp_dp_task_init(struct comp_dev *comp)
 	return scheduler_dp_task_init(&comp->task, SOF_UUID(dp_task_uuid), &ops, mod,
 				      comp->ipc_config.core, stack_size, flags);
 }
+
+void pipeline_comp_dp_task_free(struct comp_dev *comp)
+{
+	uint16_t core = comp->ipc_config.core;
+
+	/*
+	 * If the DP thread has faulted, the DP fault recovery frees the task
+	 * with the same lock held and clears comp->task, see
+	 * scheduler_dp_thread_faulted(). Read comp->task only with the lock
+	 * held, so the task is freed exactly once.
+	 */
+	scheduler_dp_free_lock(core);
+
+	if (comp->task) {
+		schedule_task_free(comp->task);
+		comp->task = NULL;
+	}
+
+	scheduler_dp_free_unlock(core);
+}
 #endif /* CONFIG_ZEPHYR_DP_SCHEDULER */
 
 void pipeline_comp_trigger_sched_comp(struct pipeline *p,

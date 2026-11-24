@@ -50,6 +50,18 @@ void scheduler_dp_unlock(unsigned int key)
 	k_sem_give(&dp_lock[key]);
 }
 
+#if CONFIG_SOF_USERSPACE_APPLICATION
+void scheduler_dp_free_lock(uint16_t core)
+{
+	k_mutex_lock(&dp_free_lock[core], K_FOREVER);
+}
+
+void scheduler_dp_free_unlock(uint16_t core)
+{
+	k_mutex_unlock(&dp_free_lock[core]);
+}
+#endif
+
 #if CONFIG_SOF_USERSPACE_APPLICATION && CONFIG_SOF_USERSPACE_LL
 /* Runs in the LL user thread, see scheduler_dp_ll_post_tick() documentation */
 void scheduler_dp_ll_post_tick(unsigned int core)

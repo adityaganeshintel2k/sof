@@ -309,6 +309,17 @@ config ZEPHYR_DP_SCHEDULER_MIN_STACK_SIZE
          ext_init payload. If the stack size requested in the IPC is
          smaller than this, then the value defined here takes over.
 
+config ZEPHYR_DP_FAULT_WQ_STACK_SIZE
+	int "Stack size of the per-core DP fault recovery work queue"
+	default 2048
+	depends on ZEPHYR_DP_SCHEDULER && SOF_USERSPACE_APPLICATION
+	help
+	  When a DP module faults, only its DP thread is aborted. A kernel
+	  work queue on the core of the faulting thread then frees the
+	  resources of its DP task: the thread stack, its kernel objects
+	  and its memory domain. This is the stack size of that work
+	  queue, one is started on each core.
+
 config CROSS_CORE_STREAM
 	bool "Enable cross-core connected pipelines"
 	default y if IPC_MAJOR_4

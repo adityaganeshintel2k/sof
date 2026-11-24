@@ -416,6 +416,16 @@ void pipeline_comp_ll_task_free(struct pipeline *p);
 int pipeline_comp_dp_task_init(struct comp_dev *comp);
 
 /**
+ * \brief Frees the DP task of a component, if it still has one.
+ *
+ * Serialized with the DP fault recovery by scheduler_dp_free_lock(): if the DP
+ * thread faulted and the recovery has already freed the task, comp->task is
+ * NULL and nothing is done.
+ * \param[in,out] comp Component device whose DP task is freed.
+ */
+void pipeline_comp_dp_task_free(struct comp_dev *comp);
+
+/**
  * \brief Schedules a pipeline copy operation to run after a delay.
  * \param[in,out] p Target pipeline.
  * \param[in] start Pipeline start time in microseconds.

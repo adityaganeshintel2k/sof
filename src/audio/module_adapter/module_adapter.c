@@ -393,7 +393,10 @@ __cold struct comp_dev *module_adapter_new_ext(const struct comp_driver *drv,
 
 err:
 #if CONFIG_ZEPHYR_DP_SCHEDULER
-	if (dev->task)
+	/* serialized with the DP fault recovery, which may have freed the task */
+	if (dev->ipc_config.proc_domain == COMP_PROCESSING_DOMAIN_DP)
+		pipeline_comp_dp_task_free(dev);
+	else if (dev->task)
 		schedule_task_free(dev->task);
 #endif
 	/* When module_init is called in this function, it can store this dev in its pipeline.
@@ -771,6 +774,12 @@ __cold void module_adapter_free(struct comp_dev *dev)
 	if (ret)
 		comp_err(dev, "failed with error: %d", ret);
 
+#if CONFIG_ZEPHYR_DP_SCHEDULER
+	/* serialized with the DP fault recovery, which may have freed the task */
+	if (dev->ipc_config.proc_domain == COMP_PROCESSING_DOMAIN_DP)
+		pipeline_comp_dp_task_free(dev);
+	else
+#endif
 	if (dev->task)
 		schedule_task_free(dev->task);
 

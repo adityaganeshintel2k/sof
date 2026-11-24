@@ -80,6 +80,29 @@ struct task_dp_pdata {
 /** @brief Per-core DP thread start and IPC completion semaphores. */
 extern struct k_sem dp_sync[CONFIG_CORE_COUNT];
 
+/** @brief Per-core DP task freeing locks, see scheduler_dp_free_lock(). */
+extern struct k_mutex dp_free_lock[CONFIG_CORE_COUNT];
+
+/**
+ * @brief Grant a thread access to the DP task freeing lock of a core.
+ *
+ * Only for threads that free DP tasks, i.e. the IPC user thread. DP threads
+ * must not get it, they could otherwise block DP task freeing on their core.
+ *
+ * @param[in] thread_id Thread to grant access to.
+ * @param[in] core Core of the lock.
+ */
+void scheduler_dp_free_lock_grant(k_tid_t thread_id, uint16_t core);
+
+/**
+ * @brief Start the DP fault recovery work queue of the calling core.
+ *
+ * Called from scheduler_dp_init() on each core.
+ *
+ * @return 0 on success, negative error code on failure.
+ */
+int scheduler_dp_fault_wq_init(void);
+
 struct ipc4_flat {
 	unsigned int cmd;
 	int ret;
@@ -157,7 +180,8 @@ void scheduler_dp_recalculate(struct scheduler_dp_data *dp_sch);
  * @param[out] flat IPC parameter area in the task memory.
  * @param[out] config_data LARGE_CONFIG_GET reply buffer, or NULL.
  * @param[out] core Core of the DP task.
- * @return 0 on success, -EINVAL if @p mod has no DP task. Kernel context only.
+ * @return 0 on success, -EINVAL if @p mod has no DP task, -ENODEV if its DP
+ *	   thread has faulted. Kernel context only.
  */
 int scheduler_dp_task_ipc_params(const struct processing_module *mod, struct k_event **event,
 				 struct ipc4_flat **flat, const void **config_data,

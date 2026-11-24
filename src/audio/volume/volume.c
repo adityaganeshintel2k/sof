@@ -897,10 +897,42 @@ static const struct module_interface volume_interface = {
 };
 
 #if CONFIG_COMP_GAIN
+#if CONFIG_COMP_GAIN_DP_FAULT_INJECT
+/*
+ * DEBUG ONLY, not for upstream: test the DP fault recovery. A gain instance
+ * running as DP raises an illegal instruction exception in its DP thread on
+ * its CONFIG_COMP_GAIN_DP_FAULT_INJECT_PERIODS-th process() call. The counter
+ * is in the module's private data, so a re-created instance faults again.
+ */
+static int gain_process_fault_inject(struct processing_module *mod,
+				     struct sof_source **sources, int num_of_sources,
+				     struct sof_sink **sinks, int num_of_sinks)
+{
+	struct vol_data *cd = module_get_private_data(mod);
+
+	if (mod->dev->ipc_config.proc_domain == COMP_PROCESSING_DOMAIN_DP &&
+	    ++cd->dp_fault_inject_count == CONFIG_COMP_GAIN_DP_FAULT_INJECT_PERIODS) {
+		comp_err(mod->dev, "DP FAULT INJECT: illegal instruction in process()");
+#if defined(__XTENSA__)
+		/* not __builtin_trap(): GCC emits "break 1, 15" for it on Xtensa */
+		__asm__ volatile("ill");
+#else
+		__builtin_trap();
+#endif
+	}
+
+	return volume_process(mod, sources, num_of_sources, sinks, num_of_sinks);
+}
+#endif /* CONFIG_COMP_GAIN_DP_FAULT_INJECT */
+
 static const struct module_interface gain_interface = {
 	.init = volume_init,
 	.prepare = volume_prepare,
+#if CONFIG_COMP_GAIN_DP_FAULT_INJECT
+	.process = gain_process_fault_inject,
+#else
 	.process = volume_process,
+#endif
 	.set_configuration = volume_set_config,
 	.get_configuration = volume_get_config,
 	.reset = volume_reset,
